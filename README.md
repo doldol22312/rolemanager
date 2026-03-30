@@ -26,6 +26,10 @@ The plugin now always uses the role member ids API for explicit roles. In plugin
 - whether member search should use Discord's guild member search API
 - whether missing member details should be requested through the gateway so names and avatars resolve
 
-## Limitation
+## Current Limitations
 
-Discord still does not expose every member object up front. The plugin may need to request extra member details, and some very large servers can still stay partially resolved for names and avatars while the cache hydrates.
+- Explicit roles use Discord's `GET /guilds/{guild.id}/roles/{role.id}/member-ids` endpoint.
+- Discord caps that endpoint at 100 member IDs, so roles with more than 100 members will be truncated.
+- The default `@everyone` role still uses the local guild member cache instead of the role member IDs endpoint.
+- Missing names and avatars still depend on gateway hydration, so some users can remain partially unresolved until the client cache fills in.
+- Member search only works against the members the plugin has already loaded for the selected role.
