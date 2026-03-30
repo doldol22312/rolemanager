@@ -22,6 +22,7 @@ import {
     GuildMemberStore,
     GuildRoleStore,
     IconUtils,
+    ListScrollerThin,
     Menu,
     RestAPI,
     ScrollerThin,
@@ -30,6 +31,7 @@ import {
     Text,
     TextInput,
     Toasts,
+    useCallback,
     useEffect,
     useMemo,
     useRef,
@@ -42,6 +44,7 @@ const cl = classNameFactory("vc-role-manager-");
 const countFormat = new Intl.NumberFormat();
 const MEMBER_REQUEST_CHUNK_SIZE = 100;
 const MEMBER_SEARCH_LIMIT = 1000;
+const MEMBER_ROW_HEIGHT = 56;
 
 const authors = [
     {
@@ -78,12 +81,11 @@ interface MemberDetails {
     roleIds: string[];
 }
 
-interface StoreSnapshot {
+interface RoleCatalog {
     roles: Role[];
     cachedMemberCount: number;
     totalMemberCount: number | null;
-    roleMembers: Map<string, string[]>;
-    membersById: Map<string, MemberDetails>;
+    cachedRoleMembers: Map<string, string[]>;
 }
 
 interface RoleApiState {
@@ -96,6 +98,17 @@ interface MemberSearchState {
     status: RemoteState;
     memberIds: string[];
     error?: string;
+}
+
+interface RoleMemberLookup {
+    apiMembersById: Record<string, MemberDetails>;
+    displayedMemberIds: string[];
+    roleStatusText: string;
+    roleApiState?: RoleApiState;
+    roleUsesMemberIdsApi: boolean;
+    searchState: MemberSearchState;
+    shouldUseSearchApi: boolean;
+    refreshSelectedRole(): void;
 }
 
 function normalize(value: string) {
@@ -223,6 +236,10 @@ function makeMemberDetailsFromApi(guildId: string, raw: any): MemberDetails | nu
     };
 }
 
+function getResolvedMemberDetails(guildId: string, memberId: string, apiMembersById: Record<string, MemberDetails>) {
+    return makeMemberDetailsFromStore(guildId, memberId) ?? apiMembersById[memberId] ?? makeUnknownMemberDetails(memberId);
+}
+
 function normalizeRoleMemberIdsResponse(response: any): string[] {
     const body = response?.body ?? response;
 
@@ -278,55 +295,62 @@ async function searchGuildMembers(guildId: string, query: string) {
     return normalizeSearchMembersResponse(guildId, response);
 }
 
-function makeStoreSnapshot(guild: Guild): StoreSnapshot {
-    const roles = orderRoles(guild.id, GuildRoleStore.getSortedRoles(guild.id) ?? []);
-    const memberIds = GuildMemberStore.getMemberIds(guild.id) ?? [];
-    const roleMembers = new Map<string, string[]>();
-    const membersById = new Map<string, MemberDetails>();
+function buildCachedRoleMembers(guildId: string, roles: Role[]) {
+    const memberIds = GuildMemberStore.getMemberIds(guildId) ?? [];
+    const cachedRoleMembers = new Map<string, string[]>();
 
     for (const role of roles) {
-        roleMembers.set(role.id, []);
+        cachedRoleMembers.set(role.id, []);
     }
 
-    if (!roleMembers.has(guild.id)) {
-        roleMembers.set(guild.id, []);
+    if (!cachedRoleMembers.has(guildId)) {
+        cachedRoleMembers.set(guildId, []);
     }
 
     for (const memberId of memberIds) {
-        const memberDetails = makeMemberDetailsFromStore(guild.id, memberId);
-        if (!memberDetails) continue;
+        const member = GuildMemberStore.getMember(guildId, memberId);
+        if (!member) continue;
 
-        membersById.set(memberId, memberDetails);
-        roleMembers.get(guild.id)?.push(memberId);
+        cachedRoleMembers.get(guildId)?.push(memberId);
 
-        for (const roleId of memberDetails.roleIds) {
-            const members = roleMembers.get(roleId);
+        for (const roleId of member.roles ?? []) {
+            const members = cachedRoleMembers.get(roleId);
             if (members) members.push(memberId);
-            else roleMembers.set(roleId, [memberId]);
+            else cachedRoleMembers.set(roleId, [memberId]);
         }
     }
 
     return {
-        roles,
         cachedMemberCount: memberIds.length,
-        totalMemberCount: GuildMemberCountStore.getMemberCount(guild.id) ?? null,
-        roleMembers,
-        membersById
+        cachedRoleMembers
     };
 }
 
-function openRoleManagerModal(guild: Guild) {
-    openModal(modalProps => (
-        <ErrorBoundary>
-            <RoleManagerModal guild={guild} modalProps={modalProps} />
-        </ErrorBoundary>
-    ));
+function useRoleCatalog(guild: Guild): RoleCatalog {
+    return useStateFromStores(
+        [GuildRoleStore, GuildMemberStore, GuildMemberCountStore],
+        () => {
+            const roles = orderRoles(guild.id, GuildRoleStore.getSortedRoles(guild.id) ?? []);
+            const { cachedMemberCount, cachedRoleMembers } = buildCachedRoleMembers(guild.id, roles);
+
+            return {
+                roles,
+                cachedMemberCount,
+                totalMemberCount: GuildMemberCountStore.getMemberCount(guild.id) ?? null,
+                cachedRoleMembers
+            };
+        }
+    );
 }
 
-function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: ModalProps; }) {
-    const [roleQuery, setRoleQuery] = useState("");
-    const [memberQuery, setMemberQuery] = useState("");
-    const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
+function useRoleMemberLookup(
+    guild: Guild,
+    effectiveRoleId: string | null,
+    cachedRoleMemberIds: string[],
+    memberQuery: string,
+    useMembersSearchApi: boolean,
+    requestMissingMemberDetails: boolean
+): RoleMemberLookup {
     const [roleApiState, setRoleApiState] = useState<Record<string, RoleApiState>>({});
     const [searchState, setSearchState] = useState<MemberSearchState>({
         status: RemoteState.Idle,
@@ -334,19 +358,20 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
     });
     const [apiMembersById, setApiMembersById] = useState<Record<string, MemberDetails>>({});
 
-    const requestedMemberDetails = useRef<Set<string>>(new Set());
-
-    const { roles, cachedMemberCount, totalMemberCount, roleMembers, membersById } = useStateFromStores(
-        [GuildRoleStore, GuildMemberStore, GuildMemberCountStore, UserStore],
-        () => makeStoreSnapshot(guild)
-    );
+    const requestedMemberDetailsRef = useRef<Set<string>>(new Set());
+    const roleApiStateRef = useRef<Record<string, RoleApiState>>({});
+    const roleRequestTokenRef = useRef(new Map<string, number>());
+    const searchRequestTokenRef = useRef(0);
 
     useEffect(() => {
-        requestGuildMembers(guild.id);
-    }, [guild.id]);
+        roleApiStateRef.current = roleApiState;
+    }, [roleApiState]);
 
     useEffect(() => {
-        requestedMemberDetails.current.clear();
+        requestedMemberDetailsRef.current.clear();
+        roleApiStateRef.current = {};
+        roleRequestTokenRef.current.clear();
+        searchRequestTokenRef.current += 1;
         setRoleApiState({});
         setSearchState({
             status: RemoteState.Idle,
@@ -355,41 +380,14 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
         setApiMembersById({});
     }, [guild.id]);
 
-    const filteredRoles = useMemo(() => {
-        const query = normalize(roleQuery);
-        if (!query) return roles;
+    const roleUsesMemberIdsApi = effectiveRoleId != null && effectiveRoleId !== guild.id;
+    const selectedRoleApi = effectiveRoleId ? roleApiState[effectiveRoleId] : void 0;
 
-        return roles.filter(role => {
-            const roleName = role.id === guild.id ? "@everyone" : role.name;
-            return normalize(roleName).includes(query);
-        });
-    }, [guild.id, roleQuery, roles]);
+    const cancelRoleMemberIdRequest = useCallback((roleId: string) => {
+        roleRequestTokenRef.current.set(roleId, (roleRequestTokenRef.current.get(roleId) ?? 0) + 1);
+    }, []);
 
-    useEffect(() => {
-        if (!filteredRoles.length) {
-            setSelectedRoleId(null);
-            return;
-        }
-
-        if (!selectedRoleId || !filteredRoles.some(role => role.id === selectedRoleId)) {
-            setSelectedRoleId(filteredRoles[0].id);
-        }
-    }, [filteredRoles, selectedRoleId]);
-
-    const selectedRole = roles.find(role => role.id === selectedRoleId) ?? filteredRoles[0] ?? null;
-    const selectedRoleApi = selectedRole ? roleApiState[selectedRole.id] : void 0;
-    const cachedSelectedRoleMemberIds = selectedRole ? roleMembers.get(selectedRole.id) ?? [] : [];
-    const roleUsesMemberIdsApi = !!selectedRole && selectedRole.id !== guild.id;
-
-    const selectedRoleMemberIds = useMemo(() => {
-        if (roleUsesMemberIdsApi && selectedRoleApi?.memberIds) {
-            return selectedRoleApi.memberIds;
-        }
-
-        return cachedSelectedRoleMemberIds;
-    }, [cachedSelectedRoleMemberIds, roleUsesMemberIdsApi, selectedRoleApi?.memberIds]);
-
-    const mergeApiMembers = (members: MemberDetails[]) => {
+    const mergeApiMembers = useCallback((members: MemberDetails[]) => {
         setApiMembersById(previous => {
             const next = { ...previous };
 
@@ -399,15 +397,18 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
 
             return next;
         });
-    };
+    }, []);
 
-    const loadRoleMemberIds = async (roleId: string, force = false) => {
+    const loadRoleMemberIds = useCallback(async (roleId: string, force = false) => {
         if (!force) {
-            const current = roleApiState[roleId];
+            const current = roleApiStateRef.current[roleId];
             if (current?.status === RemoteState.Loading || current?.status === RemoteState.Loaded) {
-                return true;
+                return current?.status === RemoteState.Loaded;
             }
         }
+
+        const requestToken = (roleRequestTokenRef.current.get(roleId) ?? 0) + 1;
+        roleRequestTokenRef.current.set(roleId, requestToken);
 
         setRoleApiState(previous => ({
             ...previous,
@@ -419,6 +420,7 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
 
         try {
             const memberIds = await fetchRoleMemberIds(guild.id, roleId);
+            if (roleRequestTokenRef.current.get(roleId) !== requestToken) return false;
 
             setRoleApiState(previous => ({
                 ...previous,
@@ -430,68 +432,72 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
 
             return true;
         } catch (error) {
-            const message = getErrorMessage(error);
+            if (roleRequestTokenRef.current.get(roleId) !== requestToken) return false;
 
             setRoleApiState(previous => ({
                 ...previous,
                 [roleId]: {
                     status: RemoteState.Error,
                     memberIds: previous[roleId]?.memberIds ?? [],
-                    error: message
+                    error: getErrorMessage(error)
                 }
             }));
 
             return false;
         }
-    };
+    }, [guild.id]);
 
     useEffect(() => {
-        if (!selectedRole || !roleUsesMemberIdsApi) {
+        if (!effectiveRoleId || !roleUsesMemberIdsApi) {
             return;
         }
 
-        void loadRoleMemberIds(selectedRole.id);
-    }, [roleUsesMemberIdsApi, selectedRole?.id]);
+        void loadRoleMemberIds(effectiveRoleId);
+
+        return () => {
+            cancelRoleMemberIdRequest(effectiveRoleId);
+        };
+    }, [cancelRoleMemberIdRequest, effectiveRoleId, loadRoleMemberIds, roleUsesMemberIdsApi]);
 
     useEffect(() => {
-        if (!settings.store.requestMissingMemberDetails || !selectedRole || !roleUsesMemberIdsApi) {
+        if (!effectiveRoleId || !roleUsesMemberIdsApi || !requestMissingMemberDetails) {
             return;
         }
 
-        const apiIds = roleApiState[selectedRole.id]?.memberIds;
+        const apiIds = roleApiState[effectiveRoleId]?.memberIds;
         if (!apiIds?.length) return;
 
         const missingIds = apiIds.filter(id =>
-            !membersById.has(id)
+            GuildMemberStore.getMember(guild.id, id) == null
             && apiMembersById[id] == null
-            && !requestedMemberDetails.current.has(id)
+            && !requestedMemberDetailsRef.current.has(id)
         );
 
         if (!missingIds.length) return;
 
         for (const missingId of missingIds) {
-            requestedMemberDetails.current.add(missingId);
+            requestedMemberDetailsRef.current.add(missingId);
         }
 
         requestGuildMembersByIds(guild.id, missingIds);
     }, [
         apiMembersById,
+        effectiveRoleId,
         guild.id,
-        membersById,
+        requestMissingMemberDetails,
         roleApiState,
-        roleUsesMemberIdsApi,
-        selectedRole?.id,
-        settings.store.requestMissingMemberDetails
+        roleUsesMemberIdsApi
     ]);
 
     const memberQueryValue = memberQuery.trim();
     const shouldUseSearchApi = roleUsesMemberIdsApi
-        && settings.store.useMembersSearchApi
+        && useMembersSearchApi
         && memberQueryValue.length > 0
         && !!selectedRoleApi?.memberIds;
 
     useEffect(() => {
         if (!shouldUseSearchApi) {
+            searchRequestTokenRef.current += 1;
             setSearchState({
                 status: RemoteState.Idle,
                 memberIds: []
@@ -499,7 +505,8 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
             return;
         }
 
-        let cancelled = false;
+        const requestToken = searchRequestTokenRef.current + 1;
+        searchRequestTokenRef.current = requestToken;
 
         const timeout = window.setTimeout(() => {
             setSearchState(previous => ({
@@ -510,7 +517,7 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
 
             void searchGuildMembers(guild.id, memberQueryValue)
                 .then(members => {
-                    if (cancelled) return;
+                    if (searchRequestTokenRef.current !== requestToken) return;
 
                     mergeApiMembers(members);
 
@@ -525,7 +532,7 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                     });
                 })
                 .catch(error => {
-                    if (cancelled) return;
+                    if (searchRequestTokenRef.current !== requestToken) return;
 
                     setSearchState({
                         status: RemoteState.Error,
@@ -536,49 +543,24 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
         }, 250);
 
         return () => {
-            cancelled = true;
+            searchRequestTokenRef.current += 1;
             window.clearTimeout(timeout);
         };
-    }, [guild.id, memberQueryValue, selectedRoleApi?.memberIds, shouldUseSearchApi]);
+    }, [guild.id, memberQueryValue, mergeApiMembers, selectedRoleApi?.memberIds, shouldUseSearchApi]);
+
+    const effectiveMemberIds = roleUsesMemberIdsApi && selectedRoleApi?.memberIds
+        ? selectedRoleApi.memberIds
+        : cachedRoleMemberIds;
 
     const displayedMemberIds = shouldUseSearchApi && searchState.status === RemoteState.Loaded
         ? searchState.memberIds
-        : selectedRoleMemberIds;
+        : effectiveMemberIds;
 
-    const filteredMembers = useMemo(() => {
-        const query = normalize(memberQuery);
-        const shouldClientFilter = !(shouldUseSearchApi && searchState.status === RemoteState.Loaded);
-
-        return displayedMemberIds
-            .map(memberId => membersById.get(memberId) ?? apiMembersById[memberId] ?? makeUnknownMemberDetails(memberId))
-            .filter(member => {
-                if (!shouldClientFilter || !query) return true;
-
-                return normalize(member.displayName).includes(query)
-                    || normalize(member.username).includes(query)
-                    || member.id.includes(query);
-            })
-            .sort((memberA, memberB) => memberA.displayName.localeCompare(memberB.displayName, void 0, { sensitivity: "base" }));
-    }, [apiMembersById, displayedMemberIds, memberQuery, membersById, searchState.status, shouldUseSearchApi]);
-
-    const isFullyCached = totalMemberCount != null && cachedMemberCount >= totalMemberCount;
-    const cacheStatus = totalMemberCount == null
-        ? `${countFormat.format(cachedMemberCount)} cached members`
-        : `${countFormat.format(cachedMemberCount)} / ${countFormat.format(totalMemberCount)} cached members`;
-
-    const selectedRoleFlags = selectedRole
-        ? [
-            selectedRole.managed && "Managed",
-            selectedRole.hoist && "Shown separately",
-            selectedRole.mentionable && "Mentionable"
-        ].filter(Boolean).join(" • ")
-        : "";
-
-    const selectedRoleStatus = (() => {
-        if (!selectedRole) return "";
+    const roleStatusText = useMemo(() => {
+        if (!effectiveRoleId) return "";
 
         if (!roleUsesMemberIdsApi) {
-            return `${countFormat.format(selectedRoleMemberIds.length)} cached members for @everyone. The role API only applies to explicit roles.`;
+            return `${countFormat.format(displayedMemberIds.length)} cached members for @everyone. The role API only applies to explicit roles.`;
         }
 
         if (selectedRoleApi?.status === RemoteState.Loading) {
@@ -604,23 +586,257 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
         }
 
         return "Waiting for the role API to load...";
-    })();
+    }, [displayedMemberIds.length, effectiveRoleId, roleUsesMemberIdsApi, searchState.error, searchState.memberIds.length, searchState.status, selectedRoleApi?.error, selectedRoleApi?.memberIds, selectedRoleApi?.status, shouldUseSearchApi]);
 
-    const handleRefresh = () => {
+    const refreshSelectedRole = useCallback(() => {
         requestGuildMembers(guild.id);
 
-        if (selectedRole && roleUsesMemberIdsApi) {
-            void loadRoleMemberIds(selectedRole.id, true)
-                .then(success => showToast(
-                    success ? "Role member ids refreshed" : "Role member ids refresh failed",
-                    success ? Toasts.Type.SUCCESS : Toasts.Type.FAILURE
-                ))
-                .catch(() => { });
+        if (!effectiveRoleId || !roleUsesMemberIdsApi) {
+            showToast("Guild members refresh requested", Toasts.Type.SUCCESS);
             return;
         }
 
-        showToast("Guild members refresh requested", Toasts.Type.SUCCESS);
+        void loadRoleMemberIds(effectiveRoleId, true)
+            .then(success => showToast(
+                success ? "Role member ids refreshed" : "Role member ids refresh failed",
+                success ? Toasts.Type.SUCCESS : Toasts.Type.FAILURE
+            ))
+            .catch(() => { });
+    }, [effectiveRoleId, guild.id, loadRoleMemberIds, roleUsesMemberIdsApi]);
+
+    return {
+        apiMembersById,
+        displayedMemberIds,
+        roleStatusText,
+        roleApiState: selectedRoleApi,
+        roleUsesMemberIdsApi,
+        searchState,
+        shouldUseSearchApi,
+        refreshSelectedRole
     };
+}
+
+function RoleList({
+    effectiveRoleId,
+    guildId,
+    onRoleSelect,
+    roles,
+    roleMembers
+}: {
+    effectiveRoleId: string | null;
+    guildId: string;
+    onRoleSelect(roleId: string): void;
+    roles: Role[];
+    roleMembers: Map<string, string[]>;
+}) {
+    return (
+        <ScrollerThin className={cl("list")} orientation="auto">
+            {roles.map(role => {
+                const memberCount = roleMembers.get(role.id)?.length ?? 0;
+                const isSelected = role.id === effectiveRoleId;
+                const roleLabel = role.id === guildId ? "@everyone" : role.name;
+
+                return (
+                    <button
+                        key={role.id}
+                        type="button"
+                        className={cl("row-button")}
+                        onClick={() => onRoleSelect(role.id)}
+                        aria-label={`Select role ${roleLabel}`}
+                    >
+                        <div className={cl("row", { "row-selected": isSelected })}>
+                            <span
+                                className={cl("role-dot")}
+                                style={{ backgroundColor: role.colorString ?? "var(--interactive-normal)" }}
+                            />
+
+                            <div className={cl("row-copy")}>
+                                <Text variant="text-md/medium">{roleLabel}</Text>
+                                <Text variant="text-xs/normal" className={cl("row-subtitle")}>
+                                    {countFormat.format(memberCount)} cached members
+                                </Text>
+                            </div>
+                        </div>
+                    </button>
+                );
+            })}
+        </ScrollerThin>
+    );
+}
+
+function MemberRow({
+    apiMembersById,
+    guildId,
+    memberId
+}: {
+    apiMembersById: Record<string, MemberDetails>;
+    guildId: string;
+    memberId: string;
+}) {
+    const member = useStateFromStores(
+        [GuildMemberStore, UserStore],
+        () => getResolvedMemberDetails(guildId, memberId, apiMembersById)
+    );
+
+    return (
+        <button
+            type="button"
+            className={cl("row-button")}
+            onClick={() => void openUserProfile(member.id)}
+            aria-label={`Open profile for ${member.displayName}`}
+        >
+            <div className={cl("member-row")}>
+                {member.avatarUrl
+                    ? (
+                        <img
+                            className={cl("avatar")}
+                            src={member.avatarUrl}
+                            alt=""
+                        />
+                    )
+                    : (
+                        <div className={cl("avatar-fallback")} aria-hidden="true" />
+                    )}
+
+                <div className={cl("row-copy")}>
+                    <Text variant="text-md/medium">{member.displayName}</Text>
+                    <Text variant="text-xs/normal" className={cl("row-subtitle")}>
+                        {member.username === member.displayName ? member.id : member.username}
+                    </Text>
+                </div>
+            </div>
+        </button>
+    );
+}
+
+function MemberVirtualList({
+    apiMembersById,
+    guildId,
+    memberIds,
+    roleLabel
+}: {
+    apiMembersById: Record<string, MemberDetails>;
+    guildId: string;
+    memberIds: string[];
+    roleLabel: string;
+}) {
+    return (
+        <ListScrollerThin
+            className={cl("list")}
+            sections={[memberIds.length]}
+            sectionHeight={0}
+            rowHeight={MEMBER_ROW_HEIGHT}
+            renderSection={() => null}
+            renderRow={({ row }) => (
+                <MemberRow
+                    key={memberIds[row]}
+                    apiMembersById={apiMembersById}
+                    guildId={guildId}
+                    memberId={memberIds[row]}
+                />
+            )}
+            paddingBottom={8}
+            innerRole="list"
+            innerAriaLabel={`Members with role ${roleLabel}`}
+        />
+    );
+}
+
+function openRoleManagerModal(guild: Guild) {
+    openModal(modalProps => (
+        <ErrorBoundary>
+            <RoleManagerModal guild={guild} modalProps={modalProps} />
+        </ErrorBoundary>
+    ));
+}
+
+function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: ModalProps; }) {
+    const [roleQuery, setRoleQuery] = useState("");
+    const [memberQuery, setMemberQuery] = useState("");
+    const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
+
+    const { useMembersSearchApi, requestMissingMemberDetails } = settings.use(["useMembersSearchApi", "requestMissingMemberDetails"]);
+    const { roles, cachedMemberCount, totalMemberCount, cachedRoleMembers } = useRoleCatalog(guild);
+
+    useEffect(() => {
+        requestGuildMembers(guild.id);
+    }, [guild.id]);
+
+    const filteredRoles = useMemo(() => {
+        const query = normalize(roleQuery);
+        if (!query) return roles;
+
+        return roles.filter(role => {
+            const roleName = role.id === guild.id ? "@everyone" : role.name;
+            return normalize(roleName).includes(query);
+        });
+    }, [guild.id, roleQuery, roles]);
+
+    const effectiveRoleId = useMemo(() => {
+        if (selectedRoleId && filteredRoles.some(role => role.id === selectedRoleId)) {
+            return selectedRoleId;
+        }
+
+        return filteredRoles[0]?.id ?? null;
+    }, [filteredRoles, selectedRoleId]);
+
+    const selectedRole = useMemo(
+        () => roles.find(role => role.id === effectiveRoleId) ?? null,
+        [effectiveRoleId, roles]
+    );
+
+    const cachedSelectedRoleMemberIds = selectedRole
+        ? cachedRoleMembers.get(selectedRole.id) ?? []
+        : [];
+
+    const roleLookup = useRoleMemberLookup(
+        guild,
+        effectiveRoleId,
+        cachedSelectedRoleMemberIds,
+        memberQuery,
+        useMembersSearchApi,
+        requestMissingMemberDetails
+    );
+
+    const filteredMemberIds = useMemo(() => {
+        const query = normalize(memberQuery);
+        const shouldClientFilter = !(roleLookup.shouldUseSearchApi && roleLookup.searchState.status === RemoteState.Loaded);
+
+        const memberIds = shouldClientFilter && query
+            ? roleLookup.displayedMemberIds.filter(memberId => {
+                const member = getResolvedMemberDetails(guild.id, memberId, roleLookup.apiMembersById);
+
+                return normalize(member.displayName).includes(query)
+                    || normalize(member.username).includes(query)
+                    || member.id.includes(query);
+            })
+            : roleLookup.displayedMemberIds;
+
+        return [...memberIds].sort((memberAId, memberBId) => {
+            const memberA = getResolvedMemberDetails(guild.id, memberAId, roleLookup.apiMembersById);
+            const memberB = getResolvedMemberDetails(guild.id, memberBId, roleLookup.apiMembersById);
+            return memberA.displayName.localeCompare(memberB.displayName, void 0, { sensitivity: "base" });
+        });
+    }, [guild.id, memberQuery, roleLookup.apiMembersById, roleLookup.displayedMemberIds, roleLookup.searchState.status, roleLookup.shouldUseSearchApi]);
+
+    const isFullyCached = totalMemberCount != null && cachedMemberCount >= totalMemberCount;
+    const cacheStatus = totalMemberCount == null
+        ? `${countFormat.format(cachedMemberCount)} cached members`
+        : `${countFormat.format(cachedMemberCount)} / ${countFormat.format(totalMemberCount)} cached members`;
+
+    const selectedRoleFlags = selectedRole
+        ? [
+            selectedRole.managed && "Managed",
+            selectedRole.hoist && "Shown separately",
+            selectedRole.mentionable && "Mentionable"
+        ].filter(Boolean).join(" • ")
+        : "";
+
+    const roleLabel = selectedRole
+        ? selectedRole.id === guild.id
+            ? "@everyone"
+            : selectedRole.name
+        : "selected role";
 
     return (
         <ModalRoot {...modalProps} size={ModalSize.LARGE}>
@@ -644,8 +860,9 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                     </div>
 
                     <Button
-                        onClick={handleRefresh}
+                        onClick={roleLookup.refreshSelectedRole}
                         color={Button.Colors.BRAND}
+                        aria-label="Refresh role member ids and guild member cache"
                     >
                         Refresh Data
                     </Button>
@@ -663,48 +880,27 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                             value={roleQuery}
                             onChange={setRoleQuery}
                             className={cl("search")}
+                            aria-label="Search roles"
                         />
 
-                        <ScrollerThin className={cl("list")} orientation="auto">
-                            {filteredRoles.map(role => {
-                                const memberCount = roleMembers.get(role.id)?.length ?? 0;
-                                const isSelected = role.id === selectedRole?.id;
-
-                                return (
-                                    <button
-                                        key={role.id}
-                                        type="button"
-                                        className={cl("row-button")}
-                                        onClick={() => {
-                                            setSelectedRoleId(role.id);
-                                            setMemberQuery("");
-                                        }}
-                                    >
-                                        <div className={cl("row", { "row-selected": isSelected })}>
-                                            <span
-                                                className={cl("role-dot")}
-                                                style={{ backgroundColor: role.colorString ?? "var(--interactive-normal)" }}
-                                            />
-
-                                            <div className={cl("row-copy")}>
-                                                <Text variant="text-md/medium">
-                                                    {role.id === guild.id ? "@everyone" : role.name}
-                                                </Text>
-                                                <Text variant="text-xs/normal" className={cl("row-subtitle")}>
-                                                    {countFormat.format(memberCount)} cached members
-                                                </Text>
-                                            </div>
-                                        </div>
-                                    </button>
-                                );
-                            })}
-
-                            {!filteredRoles.length && (
+                        {filteredRoles.length
+                            ? (
+                                <RoleList
+                                    effectiveRoleId={effectiveRoleId}
+                                    guildId={guild.id}
+                                    onRoleSelect={roleId => {
+                                        setSelectedRoleId(roleId);
+                                        setMemberQuery("");
+                                    }}
+                                    roles={filteredRoles}
+                                    roleMembers={cachedRoleMembers}
+                                />
+                            )
+                            : (
                                 <div className={cl("empty")}>
                                     <Text variant="text-sm/normal">No roles match that search.</Text>
                                 </div>
                             )}
-                        </ScrollerThin>
                     </section>
 
                     <section className={cl("panel")}>
@@ -725,10 +921,8 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                                         />
 
                                         <div className={cl("selected-role-copy")}>
-                                            <Text variant="heading-md/semibold">
-                                                {selectedRole.id === guild.id ? "@everyone" : selectedRole.name}
-                                            </Text>
-                                            <Forms.FormText>{selectedRoleStatus}</Forms.FormText>
+                                            <Text variant="heading-md/semibold">{roleLabel}</Text>
+                                            <Forms.FormText>{roleLookup.roleStatusText}</Forms.FormText>
                                         </div>
                                     </div>
 
@@ -742,55 +936,33 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                                     value={memberQuery}
                                     onChange={setMemberQuery}
                                     className={cl("search")}
+                                    aria-label={`Search members in ${roleLabel}`}
                                 />
 
-                                <ScrollerThin className={cl("list")} orientation="auto">
-                                    {filteredMembers.map(member => (
-                                        <button
-                                            key={member.id}
-                                            type="button"
-                                            className={cl("row-button")}
-                                            onClick={() => void openUserProfile(member.id)}
-                                        >
-                                            <div className={cl("member-row")}>
-                                                {member.avatarUrl
-                                                    ? (
-                                                        <img
-                                                            className={cl("avatar")}
-                                                            src={member.avatarUrl}
-                                                            alt=""
-                                                        />
-                                                    )
-                                                    : (
-                                                        <div className={cl("avatar-fallback")} aria-hidden="true" />
-                                                    )}
-
-                                                <div className={cl("row-copy")}>
-                                                    <Text variant="text-md/medium">{member.displayName}</Text>
-                                                    <Text variant="text-xs/normal" className={cl("row-subtitle")}>
-                                                        {member.username === member.displayName ? member.id : member.username}
-                                                    </Text>
-                                                </div>
-                                            </div>
-                                        </button>
-                                    ))}
-
-                                    {!filteredMembers.length && (
+                                {filteredMemberIds.length
+                                    ? (
+                                        <MemberVirtualList
+                                            apiMembersById={roleLookup.apiMembersById}
+                                            guildId={guild.id}
+                                            memberIds={filteredMemberIds}
+                                            roleLabel={roleLabel}
+                                        />
+                                    )
+                                    : (
                                         <div className={cl("empty")}>
                                             <Text variant="text-sm/normal">
-                                                {searchState.status === RemoteState.Loading
+                                                {roleLookup.searchState.status === RemoteState.Loading
                                                     ? "Searching members..."
-                                                    : roleUsesMemberIdsApi && selectedRoleApi?.status === RemoteState.Loaded
-                                                        ? memberQueryValue
+                                                    : roleLookup.roleUsesMemberIdsApi && roleLookup.roleApiState?.status === RemoteState.Loaded
+                                                        ? memberQuery.trim()
                                                             ? "No role members matched that search."
                                                             : "The API returned no members for this role."
-                                                        : selectedRoleMemberIds.length
+                                                        : roleLookup.displayedMemberIds.length
                                                             ? "No members match that search."
                                                             : "No members have been loaded for this role yet."}
                                             </Text>
                                         </div>
                                     )}
-                                </ScrollerThin>
                             </>
                         )}
                     </section>
