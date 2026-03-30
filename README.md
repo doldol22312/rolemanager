@@ -3,9 +3,9 @@
 A Vencord custom plugin that adds a `Role Manager` entry to a server's context menu so you can:
 
 - see every role in the server
-- inspect which loaded members have a selected role
+- inspect which members have a selected role
 - request more guild members without needing moderation permissions
-- optionally use Discord's role member ids API instead of only the local member cache
+- use Discord's role member ids API instead of relying on a cache-only mode
 
 ## Install
 
@@ -21,11 +21,11 @@ Then rebuild Vencord.
 
 Right-click a server icon, or open the server header popout, then click `Role Manager`.
 
-In the plugin settings you can switch the member source between:
+The plugin now always uses the role member ids API for explicit roles. In plugin settings you can still control:
 
-- `Gateway Cache`: uses the members your client has already loaded
-- `Role Member IDs API`: fetches member ids for the selected role and can also use Discord's guild member search API when you type in the member search box
+- whether member search should use Discord's guild member search API
+- whether missing member details should be requested through the gateway so names and avatars resolve
 
 ## Limitation
 
-Discord still does not expose every member object up front. Even with the API-backed option, the plugin may need to request extra member details and some very large servers can still stay partially resolved for names and avatars.
+Discord still does not expose every member object up front. The plugin may need to request extra member details, and some very large servers can still stay partially resolved for names and avatars while the cache hydrates.

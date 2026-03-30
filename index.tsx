@@ -50,11 +50,6 @@ const authors = [
     }
 ];
 
-const enum MemberSource {
-    Cache = "cache",
-    RoleMemberIdsApi = "roleMemberIdsApi"
-}
-
 const enum RemoteState {
     Idle = "idle",
     Loading = "loading",
@@ -63,21 +58,13 @@ const enum RemoteState {
 }
 
 const settings = definePluginSettings({
-    memberSource: {
-        description: "How to build the member list for a selected role",
-        type: OptionType.SELECT,
-        options: [
-            { label: "Gateway Cache", value: MemberSource.Cache, default: true },
-            { label: "Role Member IDs API", value: MemberSource.RoleMemberIdsApi }
-        ]
-    },
     useMembersSearchApi: {
-        description: "When using the API source and searching members, query Discord's Search Guild Members API and intersect the results with the selected role",
+        description: "When searching members, query Discord's Search Guild Members API and intersect the results with the selected role",
         type: OptionType.BOOLEAN,
         default: true
     },
     requestMissingMemberDetails: {
-        description: "When the API source returns uncached user ids, request their guild member objects through Discord's gateway",
+        description: "When the API returns uncached user ids, request their guild member objects through Discord's gateway",
         type: OptionType.BOOLEAN,
         default: true
     }
@@ -354,8 +341,6 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
         () => makeStoreSnapshot(guild)
     );
 
-    const usingRoleApi = settings.store.memberSource === MemberSource.RoleMemberIdsApi;
-
     useEffect(() => {
         requestGuildMembers(guild.id);
     }, [guild.id]);
@@ -394,15 +379,15 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
     const selectedRole = roles.find(role => role.id === selectedRoleId) ?? filteredRoles[0] ?? null;
     const selectedRoleApi = selectedRole ? roleApiState[selectedRole.id] : void 0;
     const cachedSelectedRoleMemberIds = selectedRole ? roleMembers.get(selectedRole.id) ?? [] : [];
-    const roleApiSupported = !!selectedRole && selectedRole.id !== guild.id;
+    const roleUsesMemberIdsApi = !!selectedRole && selectedRole.id !== guild.id;
 
     const selectedRoleMemberIds = useMemo(() => {
-        if (usingRoleApi && roleApiSupported && selectedRoleApi?.memberIds) {
+        if (roleUsesMemberIdsApi && selectedRoleApi?.memberIds) {
             return selectedRoleApi.memberIds;
         }
 
         return cachedSelectedRoleMemberIds;
-    }, [cachedSelectedRoleMemberIds, roleApiSupported, selectedRoleApi?.memberIds, usingRoleApi]);
+    }, [cachedSelectedRoleMemberIds, roleUsesMemberIdsApi, selectedRoleApi?.memberIds]);
 
     const mergeApiMembers = (members: MemberDetails[]) => {
         setApiMembersById(previous => {
@@ -461,15 +446,15 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
     };
 
     useEffect(() => {
-        if (!usingRoleApi || !selectedRole || !roleApiSupported) {
+        if (!selectedRole || !roleUsesMemberIdsApi) {
             return;
         }
 
         void loadRoleMemberIds(selectedRole.id);
-    }, [roleApiSupported, selectedRole?.id, usingRoleApi]);
+    }, [roleUsesMemberIdsApi, selectedRole?.id]);
 
     useEffect(() => {
-        if (!usingRoleApi || !settings.store.requestMissingMemberDetails || !selectedRole || !roleApiSupported) {
+        if (!settings.store.requestMissingMemberDetails || !selectedRole || !roleUsesMemberIdsApi) {
             return;
         }
 
@@ -494,14 +479,13 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
         guild.id,
         membersById,
         roleApiState,
-        roleApiSupported,
+        roleUsesMemberIdsApi,
         selectedRole?.id,
-        usingRoleApi
+        settings.store.requestMissingMemberDetails
     ]);
 
     const memberQueryValue = memberQuery.trim();
-    const shouldUseSearchApi = usingRoleApi
-        && roleApiSupported
+    const shouldUseSearchApi = roleUsesMemberIdsApi
         && settings.store.useMembersSearchApi
         && memberQueryValue.length > 0
         && !!selectedRoleApi?.memberIds;
@@ -593,11 +577,7 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
     const selectedRoleStatus = (() => {
         if (!selectedRole) return "";
 
-        if (!usingRoleApi) {
-            return `${countFormat.format(selectedRoleMemberIds.length)} cached members with this role`;
-        }
-
-        if (!roleApiSupported) {
+        if (!roleUsesMemberIdsApi) {
             return `${countFormat.format(selectedRoleMemberIds.length)} cached members for @everyone. The role API only applies to explicit roles.`;
         }
 
@@ -629,7 +609,7 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
     const handleRefresh = () => {
         requestGuildMembers(guild.id);
 
-        if (usingRoleApi && selectedRole && roleApiSupported) {
+        if (selectedRole && roleUsesMemberIdsApi) {
             void loadRoleMemberIds(selectedRole.id, true)
                 .then(success => showToast(
                     success ? "Role member ids refreshed" : "Role member ids refresh failed",
@@ -656,10 +636,10 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                 <div className={cl("toolbar")}>
                     <div className={cl("toolbar-copy")}>
                         <Forms.FormText>
-                            View every server role and the members your client can resolve for that role. Source: {usingRoleApi ? "Role Member IDs API" : "Gateway Cache"}.
+                            View every server role and the members your client can resolve for that role using Discord's role member ids API.
                         </Forms.FormText>
                         <Forms.FormText className={cl("toolbar-status")}>
-                            {cacheStatus}{isFullyCached ? " • cache complete" : " • cache partial"}
+                            {cacheStatus}{isFullyCached ? " • cache hydrated" : " • cache still hydrating"}
                         </Forms.FormText>
                     </div>
 
@@ -800,7 +780,7 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                                             <Text variant="text-sm/normal">
                                                 {searchState.status === RemoteState.Loading
                                                     ? "Searching members..."
-                                                    : usingRoleApi && roleApiSupported && selectedRoleApi?.status === RemoteState.Loaded
+                                                    : roleUsesMemberIdsApi && selectedRoleApi?.status === RemoteState.Loaded
                                                         ? memberQueryValue
                                                             ? "No role members matched that search."
                                                             : "The API returned no members for this role."
