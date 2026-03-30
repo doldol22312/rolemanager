@@ -1,0 +1,162 @@
+.vc-role-manager-content {
+    padding: 0 16px 16px;
+}
+
+.vc-role-manager-header-copy {
+    flex: 1;
+}
+
+.vc-role-manager-toolbar {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin-bottom: 16px;
+}
+
+.vc-role-manager-toolbar-copy {
+    flex: 1;
+}
+
+.vc-role-manager-toolbar-status {
+    margin-top: 6px;
+}
+
+.vc-role-manager-layout {
+    display: grid;
+    grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+    gap: 16px;
+    min-height: 560px;
+}
+
+.vc-role-manager-panel {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    background: var(--background-secondary);
+    overflow: hidden;
+}
+
+.vc-role-manager-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 16px 12px;
+}
+
+.vc-role-manager-search {
+    margin: 0 16px 12px;
+}
+
+.vc-role-manager-list {
+    min-height: 0;
+    padding: 0 8px 8px;
+}
+
+.vc-role-manager-row-button {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+}
+
+.vc-role-manager-row,
+.vc-role-manager-member-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 4px 0;
+    padding: 12px;
+    border-radius: 10px;
+    transition: background-color 0.15s ease;
+}
+
+.vc-role-manager-row:hover,
+.vc-role-manager-member-row:hover {
+    background: var(--background-modifier-hover);
+}
+
+.vc-role-manager-row-selected {
+    background: var(--background-modifier-selected);
+}
+
+.vc-role-manager-role-dot,
+.vc-role-manager-selected-role-dot {
+    flex-shrink: 0;
+    border-radius: 999px;
+}
+
+.vc-role-manager-role-dot {
+    width: 12px;
+    height: 12px;
+}
+
+.vc-role-manager-selected-role-dot {
+    width: 18px;
+    height: 18px;
+}
+
+.vc-role-manager-selected-role {
+    padding: 16px 16px 12px;
+}
+
+.vc-role-manager-selected-role-top {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 6px;
+}
+
+.vc-role-manager-row-copy,
+.vc-role-manager-selected-role-copy {
+    min-width: 0;
+    flex: 1;
+}
+
+.vc-role-manager-row-subtitle {
+    color: var(--text-muted);
+}
+
+.vc-role-manager-avatar,
+.vc-role-manager-avatar-fallback {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    border-radius: 999px;
+}
+
+.vc-role-manager-avatar-fallback {
+    background: var(--background-modifier-accent);
+}
+
+.vc-role-manager-empty,
+.vc-role-manager-empty-state {
+    padding: 24px 16px;
+    color: var(--text-muted);
+}
+
+.vc-role-manager-empty-state {
+    margin: auto 0;
+}
+
+@media (max-width: 800px) {
+    .vc-role-manager-toolbar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .vc-role-manager-layout {
+        grid-template-columns: 1fr;
+        min-height: auto;
+    }
+
+    .vc-role-manager-panel {
+        min-height: 280px;
+    }
+}
