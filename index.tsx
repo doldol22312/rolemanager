@@ -43,11 +43,8 @@ import {
 const cl = classNameFactory("vc-role-manager-");
 const countFormat = new Intl.NumberFormat();
 const MEMBER_REQUEST_CHUNK_SIZE = 100;
-const GUILD_MEMBER_PAGE_LIMIT = 1000;
 const MEMBER_SEARCH_LIMIT = 1000;
-const MEMBERS_SEARCH_PAGE_LIMIT = 1000;
 const MEMBER_ROW_HEIGHT = 56;
-const SEARCH_DEBOUNCE_MS = 250;
 
 const authors = [
     {
@@ -63,35 +60,14 @@ const enum RemoteState {
     Error = "error"
 }
 
-const enum ExplicitRoleMemberSource {
-    RoleMemberIds = "roleMemberIds",
-    MembersSearch = "membersSearch",
-    GuildMembers = "guildMembers"
-}
-
-const roleMemberSourceLabels: Record<ExplicitRoleMemberSource, string> = {
-    [ExplicitRoleMemberSource.RoleMemberIds]: "Role Member IDs API",
-    [ExplicitRoleMemberSource.MembersSearch]: "Experimental members-search role filter",
-    [ExplicitRoleMemberSource.GuildMembers]: "Paginated Guild Members API + local role filtering"
-};
-
 const settings = definePluginSettings({
-    memberSource: {
-        description: "How explicit role members should be loaded. The experimental and paginated endpoints are likely to fail for regular users.",
-        type: OptionType.SELECT,
-        options: [
-            { label: roleMemberSourceLabels[ExplicitRoleMemberSource.RoleMemberIds], value: ExplicitRoleMemberSource.RoleMemberIds, default: true },
-            { label: roleMemberSourceLabels[ExplicitRoleMemberSource.MembersSearch], value: ExplicitRoleMemberSource.MembersSearch },
-            { label: roleMemberSourceLabels[ExplicitRoleMemberSource.GuildMembers], value: ExplicitRoleMemberSource.GuildMembers }
-        ] as const
-    },
     useMembersSearchApi: {
-        description: "When using the Role Member IDs API source, query Discord's Search Guild Members API and intersect the results with the selected role",
+        description: "When searching members, query Discord's Search Guild Members API and intersect the results with the selected role",
         type: OptionType.BOOLEAN,
         default: true
     },
     requestMissingMemberDetails: {
-        description: "When the Role Member IDs API returns uncached user ids, request their guild member objects through Discord's gateway",
+        description: "When the API returns uncached user ids, request their guild member objects through Discord's gateway",
         type: OptionType.BOOLEAN,
         default: true
     }
@@ -114,9 +90,8 @@ interface RoleCatalog {
 
 interface RoleApiState {
     status: RemoteState;
-    memberIds: string[];
+    memberIds?: string[];
     error?: string;
-    totalResultCount?: number | null;
 }
 
 interface MemberSearchState {
@@ -130,24 +105,10 @@ interface RoleMemberLookup {
     displayedMemberIds: string[];
     roleStatusText: string;
     roleApiState?: RoleApiState;
-    roleUsesRemoteSource: boolean;
+    roleUsesMemberIdsApi: boolean;
     searchState: MemberSearchState;
-    selectedSource: ExplicitRoleMemberSource;
-    selectedSourceLabel: string;
-    shouldUseRemoteSearch: boolean;
+    shouldUseSearchApi: boolean;
     refreshSelectedRole(): void;
-}
-
-interface MemberPaginationFilter {
-    user_id: string;
-    guild_joined_at: number;
-}
-
-interface MembersSearchPage {
-    entries: any[];
-    members: MemberDetails[];
-    pageResultCount: number;
-    totalResultCount: number | null;
 }
 
 function normalize(value: string) {
@@ -279,36 +240,6 @@ function getResolvedMemberDetails(guildId: string, memberId: string, apiMembersB
     return makeMemberDetailsFromStore(guildId, memberId) ?? apiMembersById[memberId] ?? makeUnknownMemberDetails(memberId);
 }
 
-function getRawMemberId(raw: any) {
-    const member = raw?.member ?? raw;
-    const user = member?.user ?? raw?.user;
-    return user?.id ?? member?.user_id ?? member?.userId ?? raw?.user_id ?? null;
-}
-
-function getRawMemberJoinedAtMs(raw: any) {
-    const member = raw?.member ?? raw;
-    const joinedAt = raw?.guild_joined_at ?? member?.joined_at ?? member?.joinedAt;
-    if (typeof joinedAt === "number" && Number.isFinite(joinedAt)) return joinedAt;
-
-    if (typeof joinedAt === "string") {
-        const parsed = Date.parse(joinedAt);
-        if (Number.isFinite(parsed)) return parsed;
-    }
-
-    return null;
-}
-
-function getMembersSearchPaginationFilter(raw: any): MemberPaginationFilter | null {
-    const userId = getRawMemberId(raw);
-    const guildJoinedAt = getRawMemberJoinedAtMs(raw);
-    if (!userId || guildJoinedAt == null) return null;
-
-    return {
-        user_id: userId,
-        guild_joined_at: guildJoinedAt
-    };
-}
-
 function normalizeRoleMemberIdsResponse(response: any): string[] {
     const body = response?.body ?? response;
 
@@ -340,51 +271,6 @@ function normalizeSearchMembersResponse(guildId: string, response: any): MemberD
         .filter((member): member is MemberDetails => member != null);
 }
 
-function normalizeGuildMembersResponse(guildId: string, response: any): MemberDetails[] {
-    const body = response?.body ?? response;
-    const entries = Array.isArray(body)
-        ? body
-        : Array.isArray(body?.members)
-            ? body.members
-            : [];
-
-    return entries
-        .map((entry: any) => makeMemberDetailsFromApi(guildId, entry))
-        .filter((member): member is MemberDetails => member != null);
-}
-
-function normalizeMembersSearchResponse(guildId: string, response: any): MembersSearchPage {
-    const body = response?.body ?? response;
-
-    if ((response?.status ?? response?.statusCode) === 202 || body?.code === 110000) {
-        const retryAfter = body?.retry_after;
-        throw new Error(
-            typeof retryAfter === "number"
-                ? `Index not yet available. Retry after ${retryAfter}s.`
-                : "Index not yet available. Try again later."
-        );
-    }
-
-    const entries =
-        Array.isArray(body?.members) ? body.members
-            : Array.isArray(body?.results) ? body.results
-                : Array.isArray(body) ? body
-                    : [];
-
-    return {
-        entries,
-        members: entries
-            .map((entry: any) => makeMemberDetailsFromApi(guildId, entry))
-            .filter((member): member is MemberDetails => member != null),
-        pageResultCount: typeof body?.page_result_count === "number"
-            ? body.page_result_count
-            : entries.length,
-        totalResultCount: typeof body?.total_result_count === "number"
-            ? body.total_result_count
-            : null
-    };
-}
-
 async function fetchRoleMemberIds(guildId: string, roleId: string) {
     const response = await RestAPI.get({
         url: `/guilds/${guildId}/roles/${roleId}/member-ids`,
@@ -407,108 +293,6 @@ async function searchGuildMembers(guildId: string, query: string) {
     });
 
     return normalizeSearchMembersResponse(guildId, response);
-}
-
-async function fetchGuildMembersPage(guildId: string, after?: string) {
-    const response = await RestAPI.get({
-        url: `/guilds/${guildId}/members`,
-        query: {
-            limit: GUILD_MEMBER_PAGE_LIMIT,
-            ...(after ? { after } : {})
-        },
-        oldFormErrors: true,
-        retries: 2
-    });
-
-    return normalizeGuildMembersResponse(guildId, response);
-}
-
-async function fetchAllGuildMembers(guildId: string) {
-    const membersById = new Map<string, MemberDetails>();
-    let after: string | undefined;
-
-    for (;;) {
-        const members = await fetchGuildMembersPage(guildId, after);
-        if (!members.length) break;
-
-        for (const member of members) {
-            membersById.set(member.id, member);
-        }
-
-        if (members.length < GUILD_MEMBER_PAGE_LIMIT) break;
-
-        const nextAfter = members[members.length - 1]?.id;
-        if (!nextAfter || nextAfter === after) break;
-
-        after = nextAfter;
-    }
-
-    return [...membersById.values()];
-}
-
-async function fetchMembersSearchPage(guildId: string, roleId: string, memberQuery?: string, after?: MemberPaginationFilter) {
-    const response = await RestAPI.post({
-        url: `/guilds/${guildId}/members-search`,
-        body: {
-            limit: MEMBERS_SEARCH_PAGE_LIMIT,
-            sort: 1,
-            and_query: {
-                role_ids: {
-                    or_query: [roleId]
-                },
-                ...(memberQuery
-                    ? {
-                        usernames: {
-                            or_query: [memberQuery]
-                        }
-                    }
-                    : {})
-            },
-            ...(after ? { after } : {})
-        },
-        oldFormErrors: true,
-        retries: 2
-    });
-
-    return normalizeMembersSearchResponse(guildId, response);
-}
-
-async function fetchAllMembersSearchMembers(guildId: string, roleId: string, memberQuery?: string) {
-    const membersById = new Map<string, MemberDetails>();
-    let totalResultCount: number | null = null;
-    let after: MemberPaginationFilter | undefined;
-
-    for (;;) {
-        const page = await fetchMembersSearchPage(guildId, roleId, memberQuery, after);
-        if (!page.members.length) {
-            totalResultCount = page.totalResultCount;
-            break;
-        }
-
-        totalResultCount = page.totalResultCount;
-
-        for (const member of page.members) {
-            membersById.set(member.id, member);
-        }
-
-        const loadedCount = membersById.size;
-        if (page.pageResultCount < MEMBERS_SEARCH_PAGE_LIMIT) break;
-        if (totalResultCount != null && loadedCount >= totalResultCount) break;
-
-        const nextAfter = getMembersSearchPaginationFilter(page.entries[page.entries.length - 1]);
-        if (!nextAfter) break;
-
-        if (after?.user_id === nextAfter.user_id && after.guild_joined_at === nextAfter.guild_joined_at) {
-            break;
-        }
-
-        after = nextAfter;
-    }
-
-    return {
-        members: [...membersById.values()],
-        totalResultCount
-    };
 }
 
 function buildCachedRoleMembers(guildId: string, roles: Role[]) {
@@ -564,16 +348,10 @@ function useRoleMemberLookup(
     effectiveRoleId: string | null,
     cachedRoleMemberIds: string[],
     memberQuery: string,
-    memberSource: ExplicitRoleMemberSource,
     useMembersSearchApi: boolean,
     requestMissingMemberDetails: boolean
 ): RoleMemberLookup {
-    const [roleMemberIdsState, setRoleMemberIdsState] = useState<Record<string, RoleApiState>>({});
-    const [membersSearchState, setMembersSearchState] = useState<Record<string, RoleApiState>>({});
-    const [guildMembersState, setGuildMembersState] = useState<RoleApiState>({
-        status: RemoteState.Idle,
-        memberIds: []
-    });
+    const [roleApiState, setRoleApiState] = useState<Record<string, RoleApiState>>({});
     const [searchState, setSearchState] = useState<MemberSearchState>({
         status: RemoteState.Idle,
         memberIds: []
@@ -581,47 +359,20 @@ function useRoleMemberLookup(
     const [apiMembersById, setApiMembersById] = useState<Record<string, MemberDetails>>({});
 
     const requestedMemberDetailsRef = useRef<Set<string>>(new Set());
-    const roleMemberIdsStateRef = useRef<Record<string, RoleApiState>>({});
-    const membersSearchStateRef = useRef<Record<string, RoleApiState>>({});
-    const guildMembersStateRef = useRef<RoleApiState>({
-        status: RemoteState.Idle,
-        memberIds: []
-    });
-    const roleMemberIdsRequestTokenRef = useRef(new Map<string, number>());
-    const membersSearchRequestTokenRef = useRef(new Map<string, number>());
-    const guildMembersRequestTokenRef = useRef(0);
+    const roleApiStateRef = useRef<Record<string, RoleApiState>>({});
+    const roleRequestTokenRef = useRef(new Map<string, number>());
     const searchRequestTokenRef = useRef(0);
 
     useEffect(() => {
-        roleMemberIdsStateRef.current = roleMemberIdsState;
-    }, [roleMemberIdsState]);
-
-    useEffect(() => {
-        membersSearchStateRef.current = membersSearchState;
-    }, [membersSearchState]);
-
-    useEffect(() => {
-        guildMembersStateRef.current = guildMembersState;
-    }, [guildMembersState]);
+        roleApiStateRef.current = roleApiState;
+    }, [roleApiState]);
 
     useEffect(() => {
         requestedMemberDetailsRef.current.clear();
-        roleMemberIdsStateRef.current = {};
-        membersSearchStateRef.current = {};
-        guildMembersStateRef.current = {
-            status: RemoteState.Idle,
-            memberIds: []
-        };
-        roleMemberIdsRequestTokenRef.current.clear();
-        membersSearchRequestTokenRef.current.clear();
-        guildMembersRequestTokenRef.current += 1;
+        roleApiStateRef.current = {};
+        roleRequestTokenRef.current.clear();
         searchRequestTokenRef.current += 1;
-        setRoleMemberIdsState({});
-        setMembersSearchState({});
-        setGuildMembersState({
-            status: RemoteState.Idle,
-            memberIds: []
-        });
+        setRoleApiState({});
         setSearchState({
             status: RemoteState.Idle,
             memberIds: []
@@ -629,30 +380,11 @@ function useRoleMemberLookup(
         setApiMembersById({});
     }, [guild.id]);
 
-    const roleUsesRemoteSource = effectiveRoleId != null && effectiveRoleId !== guild.id;
-    const selectedRoleApi = useMemo(() => {
-        if (!effectiveRoleId || !roleUsesRemoteSource) return void 0;
-
-        switch (memberSource) {
-            case ExplicitRoleMemberSource.RoleMemberIds:
-                return roleMemberIdsState[effectiveRoleId];
-            case ExplicitRoleMemberSource.MembersSearch:
-                return membersSearchState[effectiveRoleId];
-            case ExplicitRoleMemberSource.GuildMembers:
-                return guildMembersState;
-        }
-    }, [effectiveRoleId, guildMembersState, memberSource, membersSearchState, roleMemberIdsState, roleUsesRemoteSource]);
+    const roleUsesMemberIdsApi = effectiveRoleId != null && effectiveRoleId !== guild.id;
+    const selectedRoleApi = effectiveRoleId ? roleApiState[effectiveRoleId] : void 0;
 
     const cancelRoleMemberIdRequest = useCallback((roleId: string) => {
-        roleMemberIdsRequestTokenRef.current.set(roleId, (roleMemberIdsRequestTokenRef.current.get(roleId) ?? 0) + 1);
-    }, []);
-
-    const cancelMembersSearchRoleRequest = useCallback((roleId: string) => {
-        membersSearchRequestTokenRef.current.set(roleId, (membersSearchRequestTokenRef.current.get(roleId) ?? 0) + 1);
-    }, []);
-
-    const cancelGuildMembersRequest = useCallback(() => {
-        guildMembersRequestTokenRef.current += 1;
+        roleRequestTokenRef.current.set(roleId, (roleRequestTokenRef.current.get(roleId) ?? 0) + 1);
     }, []);
 
     const mergeApiMembers = useCallback((members: MemberDetails[]) => {
@@ -669,16 +401,16 @@ function useRoleMemberLookup(
 
     const loadRoleMemberIds = useCallback(async (roleId: string, force = false) => {
         if (!force) {
-            const current = roleMemberIdsStateRef.current[roleId];
+            const current = roleApiStateRef.current[roleId];
             if (current?.status === RemoteState.Loading || current?.status === RemoteState.Loaded) {
                 return current?.status === RemoteState.Loaded;
             }
         }
 
-        const requestToken = (roleMemberIdsRequestTokenRef.current.get(roleId) ?? 0) + 1;
-        roleMemberIdsRequestTokenRef.current.set(roleId, requestToken);
+        const requestToken = (roleRequestTokenRef.current.get(roleId) ?? 0) + 1;
+        roleRequestTokenRef.current.set(roleId, requestToken);
 
-        setRoleMemberIdsState(previous => ({
+        setRoleApiState(previous => ({
             ...previous,
             [roleId]: {
                 status: RemoteState.Loading,
@@ -688,9 +420,9 @@ function useRoleMemberLookup(
 
         try {
             const memberIds = await fetchRoleMemberIds(guild.id, roleId);
-            if (roleMemberIdsRequestTokenRef.current.get(roleId) !== requestToken) return false;
+            if (roleRequestTokenRef.current.get(roleId) !== requestToken) return false;
 
-            setRoleMemberIdsState(previous => ({
+            setRoleApiState(previous => ({
                 ...previous,
                 [roleId]: {
                     status: RemoteState.Loaded,
@@ -700,9 +432,9 @@ function useRoleMemberLookup(
 
             return true;
         } catch (error) {
-            if (roleMemberIdsRequestTokenRef.current.get(roleId) !== requestToken) return false;
+            if (roleRequestTokenRef.current.get(roleId) !== requestToken) return false;
 
-            setRoleMemberIdsState(previous => ({
+            setRoleApiState(previous => ({
                 ...previous,
                 [roleId]: {
                     status: RemoteState.Error,
@@ -715,144 +447,24 @@ function useRoleMemberLookup(
         }
     }, [guild.id]);
 
-    const loadMembersSearchRoleMembers = useCallback(async (roleId: string, force = false) => {
-        if (!force) {
-            const current = membersSearchStateRef.current[roleId];
-            if (current?.status === RemoteState.Loading || current?.status === RemoteState.Loaded) {
-                return current?.status === RemoteState.Loaded;
-            }
-        }
-
-        const requestToken = (membersSearchRequestTokenRef.current.get(roleId) ?? 0) + 1;
-        membersSearchRequestTokenRef.current.set(roleId, requestToken);
-
-        setMembersSearchState(previous => ({
-            ...previous,
-            [roleId]: {
-                status: RemoteState.Loading,
-                memberIds: previous[roleId]?.memberIds ?? [],
-                totalResultCount: previous[roleId]?.totalResultCount ?? null
-            }
-        }));
-
-        try {
-            const result = await fetchAllMembersSearchMembers(guild.id, roleId);
-            if (membersSearchRequestTokenRef.current.get(roleId) !== requestToken) return false;
-
-            mergeApiMembers(result.members);
-
-            setMembersSearchState(previous => ({
-                ...previous,
-                [roleId]: {
-                    status: RemoteState.Loaded,
-                    memberIds: result.members.map(member => member.id),
-                    totalResultCount: result.totalResultCount
-                }
-            }));
-
-            return true;
-        } catch (error) {
-            if (membersSearchRequestTokenRef.current.get(roleId) !== requestToken) return false;
-
-            setMembersSearchState(previous => ({
-                ...previous,
-                [roleId]: {
-                    status: RemoteState.Error,
-                    memberIds: previous[roleId]?.memberIds ?? [],
-                    error: getErrorMessage(error),
-                    totalResultCount: previous[roleId]?.totalResultCount ?? null
-                }
-            }));
-
-            return false;
-        }
-    }, [guild.id, mergeApiMembers]);
-
-    const loadGuildMembers = useCallback(async (force = false) => {
-        if (!force) {
-            const { status } = guildMembersStateRef.current;
-            if (status === RemoteState.Loading || status === RemoteState.Loaded) {
-                return status === RemoteState.Loaded;
-            }
-        }
-
-        const requestToken = guildMembersRequestTokenRef.current + 1;
-        guildMembersRequestTokenRef.current = requestToken;
-
-        setGuildMembersState(previous => ({
-            ...previous,
-            status: RemoteState.Loading,
-            error: void 0
-        }));
-
-        try {
-            const members = await fetchAllGuildMembers(guild.id);
-            if (guildMembersRequestTokenRef.current !== requestToken) return false;
-
-            mergeApiMembers(members);
-
-            setGuildMembersState({
-                status: RemoteState.Loaded,
-                memberIds: members.map(member => member.id)
-            });
-
-            return true;
-        } catch (error) {
-            if (guildMembersRequestTokenRef.current !== requestToken) return false;
-
-            setGuildMembersState(previous => ({
-                status: RemoteState.Error,
-                memberIds: previous.memberIds,
-                error: getErrorMessage(error)
-            }));
-
-            return false;
-        }
-    }, [guild.id, mergeApiMembers]);
-
     useEffect(() => {
-        if (!effectiveRoleId || !roleUsesRemoteSource) {
+        if (!effectiveRoleId || !roleUsesMemberIdsApi) {
             return;
         }
 
-        switch (memberSource) {
-            case ExplicitRoleMemberSource.RoleMemberIds:
-                void loadRoleMemberIds(effectiveRoleId);
+        void loadRoleMemberIds(effectiveRoleId);
 
-                return () => {
-                    cancelRoleMemberIdRequest(effectiveRoleId);
-                };
-            case ExplicitRoleMemberSource.MembersSearch:
-                void loadMembersSearchRoleMembers(effectiveRoleId);
-
-                return () => {
-                    cancelMembersSearchRoleRequest(effectiveRoleId);
-                };
-            case ExplicitRoleMemberSource.GuildMembers:
-                void loadGuildMembers();
-
-                return () => {
-                    cancelGuildMembersRequest();
-                };
-        }
-    }, [
-        cancelGuildMembersRequest,
-        cancelMembersSearchRoleRequest,
-        cancelRoleMemberIdRequest,
-        effectiveRoleId,
-        loadGuildMembers,
-        loadMembersSearchRoleMembers,
-        loadRoleMemberIds,
-        memberSource,
-        roleUsesRemoteSource
-    ]);
+        return () => {
+            cancelRoleMemberIdRequest(effectiveRoleId);
+        };
+    }, [cancelRoleMemberIdRequest, effectiveRoleId, loadRoleMemberIds, roleUsesMemberIdsApi]);
 
     useEffect(() => {
-        if (!effectiveRoleId || !roleUsesRemoteSource || !requestMissingMemberDetails || memberSource !== ExplicitRoleMemberSource.RoleMemberIds) {
+        if (!effectiveRoleId || !roleUsesMemberIdsApi || !requestMissingMemberDetails) {
             return;
         }
 
-        const apiIds = roleMemberIdsState[effectiveRoleId]?.memberIds;
+        const apiIds = roleApiState[effectiveRoleId]?.memberIds;
         if (!apiIds?.length) return;
 
         const missingIds = apiIds.filter(id =>
@@ -872,26 +484,19 @@ function useRoleMemberLookup(
         apiMembersById,
         effectiveRoleId,
         guild.id,
-        memberSource,
         requestMissingMemberDetails,
-        roleMemberIdsState,
-        roleUsesRemoteSource
+        roleApiState,
+        roleUsesMemberIdsApi
     ]);
 
     const memberQueryValue = memberQuery.trim();
-    const shouldUseRemoteSearch = roleUsesRemoteSource
+    const shouldUseSearchApi = roleUsesMemberIdsApi
+        && useMembersSearchApi
         && memberQueryValue.length > 0
-        && (
-            memberSource === ExplicitRoleMemberSource.MembersSearch
-            || (
-                memberSource === ExplicitRoleMemberSource.RoleMemberIds
-                && useMembersSearchApi
-                && selectedRoleApi?.status === RemoteState.Loaded
-            )
-        );
+        && !!selectedRoleApi?.memberIds;
 
     useEffect(() => {
-        if (!effectiveRoleId || !roleUsesRemoteSource || !shouldUseRemoteSearch) {
+        if (!shouldUseSearchApi) {
             searchRequestTokenRef.current += 1;
             setSearchState({
                 status: RemoteState.Idle,
@@ -910,24 +515,20 @@ function useRoleMemberLookup(
                 error: void 0
             }));
 
-            const searchPromise = memberSource === ExplicitRoleMemberSource.MembersSearch
-                ? fetchAllMembersSearchMembers(guild.id, effectiveRoleId, memberQueryValue)
-                    .then(result => result.members)
-                : searchGuildMembers(guild.id, memberQueryValue);
-
-            void searchPromise
+            void searchGuildMembers(guild.id, memberQueryValue)
                 .then(members => {
                     if (searchRequestTokenRef.current !== requestToken) return;
 
                     mergeApiMembers(members);
 
+                    const allowedIds = new Set(selectedRoleApi?.memberIds ?? []);
+                    const filteredIds = members
+                        .map(member => member.id)
+                        .filter(id => allowedIds.has(id));
+
                     setSearchState({
                         status: RemoteState.Loaded,
-                        memberIds: memberSource === ExplicitRoleMemberSource.RoleMemberIds
-                            ? members
-                                .map(member => member.id)
-                                .filter(id => new Set(selectedRoleApi?.memberIds ?? []).has(id))
-                            : members.map(member => member.id)
+                        memberIds: filteredIds
                     });
                 })
                 .catch(error => {
@@ -939,161 +540,78 @@ function useRoleMemberLookup(
                         error: getErrorMessage(error)
                     });
                 });
-        }, SEARCH_DEBOUNCE_MS);
+        }, 250);
 
         return () => {
             searchRequestTokenRef.current += 1;
             window.clearTimeout(timeout);
         };
-    }, [effectiveRoleId, guild.id, memberQueryValue, memberSource, mergeApiMembers, roleUsesRemoteSource, selectedRoleApi?.memberIds, shouldUseRemoteSearch]);
+    }, [guild.id, memberQueryValue, mergeApiMembers, selectedRoleApi?.memberIds, shouldUseSearchApi]);
 
-    const guildRoleMemberIds = useMemo(() => {
-        if (!effectiveRoleId || !roleUsesRemoteSource || memberSource !== ExplicitRoleMemberSource.GuildMembers) {
-            return [];
-        }
+    const effectiveMemberIds = roleUsesMemberIdsApi && selectedRoleApi?.memberIds
+        ? selectedRoleApi.memberIds
+        : cachedRoleMemberIds;
 
-        return guildMembersState.memberIds.filter(memberId => {
-            const member = getResolvedMemberDetails(guild.id, memberId, apiMembersById);
-            return member.roleIds.includes(effectiveRoleId);
-        });
-    }, [apiMembersById, effectiveRoleId, guild.id, guildMembersState.memberIds, memberSource, roleUsesRemoteSource]);
-
-    const effectiveMemberIds = useMemo(() => {
-        if (!effectiveRoleId) return [];
-        if (!roleUsesRemoteSource) return cachedRoleMemberIds;
-
-        switch (memberSource) {
-            case ExplicitRoleMemberSource.RoleMemberIds:
-            case ExplicitRoleMemberSource.MembersSearch:
-                return selectedRoleApi?.memberIds ?? [];
-            case ExplicitRoleMemberSource.GuildMembers:
-                return guildRoleMemberIds;
-        }
-    }, [cachedRoleMemberIds, effectiveRoleId, guildRoleMemberIds, memberSource, roleUsesRemoteSource, selectedRoleApi?.memberIds]);
-
-    const displayedMemberIds = shouldUseRemoteSearch && searchState.status === RemoteState.Loaded
+    const displayedMemberIds = shouldUseSearchApi && searchState.status === RemoteState.Loaded
         ? searchState.memberIds
         : effectiveMemberIds;
 
     const roleStatusText = useMemo(() => {
         if (!effectiveRoleId) return "";
 
-        if (!roleUsesRemoteSource) {
-            return `${countFormat.format(displayedMemberIds.length)} cached members for @everyone. Explicit-role source: ${roleMemberSourceLabels[memberSource]}.`;
+        if (!roleUsesMemberIdsApi) {
+            return `${countFormat.format(displayedMemberIds.length)} cached members for @everyone. The role API only applies to explicit roles.`;
         }
 
-        const searchSuffix = shouldUseRemoteSearch
-            ? searchState.status === RemoteState.Loading
-                ? memberSource === ExplicitRoleMemberSource.MembersSearch
-                    ? " • searching via experimental members-search..."
-                    : " • searching matching members..."
-                : searchState.status === RemoteState.Error
-                    ? memberSource === ExplicitRoleMemberSource.MembersSearch
-                        ? ` • experimental members-search failed: ${searchState.error}`
-                        : ` • member search failed: ${searchState.error}`
-                    : searchState.status === RemoteState.Loaded
-                        ? memberSource === ExplicitRoleMemberSource.MembersSearch
-                            ? ` • ${countFormat.format(searchState.memberIds.length)} members matched your search via experimental members-search`
-                            : ` • ${countFormat.format(searchState.memberIds.length)} members matched your search`
-                        : ""
-            : "";
-
-        switch (memberSource) {
-            case ExplicitRoleMemberSource.RoleMemberIds:
-                if (selectedRoleApi?.status === RemoteState.Loading) {
-                    return "Loading role member ids from the API...";
-                }
-
-                if (selectedRoleApi?.status === RemoteState.Error) {
-                    return `Role Member IDs API failed: ${selectedRoleApi.error}`;
-                }
-
-                if (selectedRoleApi?.status === RemoteState.Loaded) {
-                    return `${countFormat.format(selectedRoleApi.memberIds.length)} member ids loaded from the role API${searchSuffix}`;
-                }
-
-                return "Waiting for the Role Member IDs API to load...";
-            case ExplicitRoleMemberSource.MembersSearch:
-                if (selectedRoleApi?.status === RemoteState.Loading) {
-                    return "Loading members via experimental members-search role filter...";
-                }
-
-                if (selectedRoleApi?.status === RemoteState.Error) {
-                    return `Experimental members-search failed: ${selectedRoleApi.error}`;
-                }
-
-                if (selectedRoleApi?.status === RemoteState.Loaded) {
-                    const { totalResultCount, memberIds } = selectedRoleApi;
-                    const loadedCount = memberIds.length;
-                    const countLabel = totalResultCount != null && totalResultCount > loadedCount
-                        ? `${countFormat.format(loadedCount)} / ${countFormat.format(totalResultCount)} members loaded from experimental members-search`
-                        : `${countFormat.format(loadedCount)} members loaded from experimental members-search`;
-
-                    return `${countLabel}${searchSuffix}`;
-                }
-
-                return "Waiting for experimental members-search to load...";
-            case ExplicitRoleMemberSource.GuildMembers:
-                if (selectedRoleApi?.status === RemoteState.Loading) {
-                    return "Loading paginated guild members API and filtering the selected role locally...";
-                }
-
-                if (selectedRoleApi?.status === RemoteState.Error) {
-                    return `Paginated guild members API failed: ${selectedRoleApi.error}`;
-                }
-
-                if (selectedRoleApi?.status === RemoteState.Loaded) {
-                    return `${countFormat.format(effectiveMemberIds.length)} members matched this role from ${countFormat.format(selectedRoleApi.memberIds.length)} paginated guild members`;
-                }
-
-                return "Waiting for the paginated guild members API to load...";
+        if (selectedRoleApi?.status === RemoteState.Loading) {
+            return "Loading role member ids from the API...";
         }
-    }, [displayedMemberIds.length, effectiveMemberIds.length, effectiveRoleId, memberSource, roleUsesRemoteSource, searchState.error, searchState.memberIds.length, searchState.status, selectedRoleApi?.error, selectedRoleApi?.memberIds, selectedRoleApi?.status, selectedRoleApi?.totalResultCount, shouldUseRemoteSearch]);
+
+        if (selectedRoleApi?.status === RemoteState.Error) {
+            return `Role member API failed: ${selectedRoleApi.error}`;
+        }
+
+        if (selectedRoleApi?.status === RemoteState.Loaded) {
+            const suffix = shouldUseSearchApi
+                ? searchState.status === RemoteState.Loading
+                    ? " • searching matching members..."
+                    : searchState.status === RemoteState.Error
+                        ? ` • member search failed: ${searchState.error}`
+                        : searchState.status === RemoteState.Loaded
+                            ? ` • ${countFormat.format(searchState.memberIds.length)} members matched your search`
+                            : ""
+                : "";
+
+            return `${countFormat.format(selectedRoleApi.memberIds?.length ?? 0)} member ids loaded from the role API${suffix}`;
+        }
+
+        return "Waiting for the role API to load...";
+    }, [displayedMemberIds.length, effectiveRoleId, roleUsesMemberIdsApi, searchState.error, searchState.memberIds.length, searchState.status, selectedRoleApi?.error, selectedRoleApi?.memberIds, selectedRoleApi?.status, shouldUseSearchApi]);
 
     const refreshSelectedRole = useCallback(() => {
         requestGuildMembers(guild.id);
 
-        if (!effectiveRoleId || !roleUsesRemoteSource) {
+        if (!effectiveRoleId || !roleUsesMemberIdsApi) {
             showToast("Guild members refresh requested", Toasts.Type.SUCCESS);
             return;
         }
 
-        const refreshPromise = memberSource === ExplicitRoleMemberSource.RoleMemberIds
-            ? loadRoleMemberIds(effectiveRoleId, true)
-            : memberSource === ExplicitRoleMemberSource.MembersSearch
-                ? loadMembersSearchRoleMembers(effectiveRoleId, true)
-                : loadGuildMembers(true);
-
-        const successMessage = memberSource === ExplicitRoleMemberSource.RoleMemberIds
-            ? "Role member ids refreshed"
-            : memberSource === ExplicitRoleMemberSource.MembersSearch
-                ? "Experimental members-search data refreshed"
-                : "Paginated guild members refreshed";
-
-        const failureMessage = memberSource === ExplicitRoleMemberSource.RoleMemberIds
-            ? "Role member ids refresh failed"
-            : memberSource === ExplicitRoleMemberSource.MembersSearch
-                ? "Experimental members-search refresh failed"
-                : "Paginated guild members refresh failed";
-
-        void refreshPromise
+        void loadRoleMemberIds(effectiveRoleId, true)
             .then(success => showToast(
-                success ? successMessage : failureMessage,
+                success ? "Role member ids refreshed" : "Role member ids refresh failed",
                 success ? Toasts.Type.SUCCESS : Toasts.Type.FAILURE
             ))
             .catch(() => { });
-    }, [effectiveRoleId, guild.id, loadGuildMembers, loadMembersSearchRoleMembers, loadRoleMemberIds, memberSource, roleUsesRemoteSource]);
+    }, [effectiveRoleId, guild.id, loadRoleMemberIds, roleUsesMemberIdsApi]);
 
     return {
         apiMembersById,
         displayedMemberIds,
         roleStatusText,
         roleApiState: selectedRoleApi,
-        roleUsesRemoteSource,
+        roleUsesMemberIdsApi,
         searchState,
-        selectedSource: memberSource,
-        selectedSourceLabel: roleMemberSourceLabels[memberSource],
-        shouldUseRemoteSearch,
+        shouldUseSearchApi,
         refreshSelectedRole
     };
 }
@@ -1237,7 +755,7 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
     const [memberQuery, setMemberQuery] = useState("");
     const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
 
-    const { memberSource, useMembersSearchApi, requestMissingMemberDetails } = settings.use(["memberSource", "useMembersSearchApi", "requestMissingMemberDetails"]);
+    const { useMembersSearchApi, requestMissingMemberDetails } = settings.use(["useMembersSearchApi", "requestMissingMemberDetails"]);
     const { roles, cachedMemberCount, totalMemberCount, cachedRoleMembers } = useRoleCatalog(guild);
 
     useEffect(() => {
@@ -1276,14 +794,13 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
         effectiveRoleId,
         cachedSelectedRoleMemberIds,
         memberQuery,
-        memberSource as ExplicitRoleMemberSource,
         useMembersSearchApi,
         requestMissingMemberDetails
     );
 
     const filteredMemberIds = useMemo(() => {
         const query = normalize(memberQuery);
-        const shouldClientFilter = !(roleLookup.shouldUseRemoteSearch && roleLookup.searchState.status === RemoteState.Loaded);
+        const shouldClientFilter = !(roleLookup.shouldUseSearchApi && roleLookup.searchState.status === RemoteState.Loaded);
 
         const memberIds = shouldClientFilter && query
             ? roleLookup.displayedMemberIds.filter(memberId => {
@@ -1300,7 +817,7 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
             const memberB = getResolvedMemberDetails(guild.id, memberBId, roleLookup.apiMembersById);
             return memberA.displayName.localeCompare(memberB.displayName, void 0, { sensitivity: "base" });
         });
-    }, [guild.id, memberQuery, roleLookup.apiMembersById, roleLookup.displayedMemberIds, roleLookup.searchState.status, roleLookup.shouldUseRemoteSearch]);
+    }, [guild.id, memberQuery, roleLookup.apiMembersById, roleLookup.displayedMemberIds, roleLookup.searchState.status, roleLookup.shouldUseSearchApi]);
 
     const isFullyCached = totalMemberCount != null && cachedMemberCount >= totalMemberCount;
     const cacheStatus = totalMemberCount == null
@@ -1321,14 +838,6 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
             : selectedRole.name
         : "selected role";
 
-    const sourceStatusText = memberSource === ExplicitRoleMemberSource.MembersSearch
-        ? "Experimental. Discord documents this endpoint as requiring Manage Server, and it may return 202 while the search index builds."
-        : memberSource === ExplicitRoleMemberSource.GuildMembers
-            ? "Experimental. Discord documents this endpoint as not usable by user accounts."
-            : useMembersSearchApi
-                ? "Member search is using Discord's Search Guild Members API when you type."
-                : "Member search is currently filtering locally from the loaded role data.";
-
     return (
         <ModalRoot {...modalProps} size={ModalSize.LARGE}>
             <ModalHeader>
@@ -1343,9 +852,8 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                 <div className={cl("toolbar")}>
                     <div className={cl("toolbar-copy")}>
                         <Forms.FormText>
-                            View every server role and the members your client can resolve for that role. Current explicit-role source: {roleLookup.selectedSourceLabel}.
+                            View every server role and the members your client can resolve for that role using Discord's role member ids API.
                         </Forms.FormText>
-                        <Forms.FormText>{sourceStatusText}</Forms.FormText>
                         <Forms.FormText className={cl("toolbar-status")}>
                             {cacheStatus}{isFullyCached ? " • cache hydrated" : " • cache still hydrating"}
                         </Forms.FormText>
@@ -1354,7 +862,7 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                     <Button
                         onClick={roleLookup.refreshSelectedRole}
                         color={Button.Colors.BRAND}
-                        aria-label={`Refresh ${roleLookup.selectedSourceLabel} data and guild member cache`}
+                        aria-label="Refresh role member ids and guild member cache"
                     >
                         Refresh Data
                     </Button>
@@ -1445,10 +953,10 @@ function RoleManagerModal({ guild, modalProps }: { guild: Guild; modalProps: Mod
                                             <Text variant="text-sm/normal">
                                                 {roleLookup.searchState.status === RemoteState.Loading
                                                     ? "Searching members..."
-                                                    : roleLookup.roleUsesRemoteSource && roleLookup.roleApiState?.status === RemoteState.Loaded
+                                                    : roleLookup.roleUsesMemberIdsApi && roleLookup.roleApiState?.status === RemoteState.Loaded
                                                         ? memberQuery.trim()
                                                             ? "No role members matched that search."
-                                                            : "The selected source returned no members for this role."
+                                                            : "The API returned no members for this role."
                                                         : roleLookup.displayedMemberIds.length
                                                             ? "No members match that search."
                                                             : "No members have been loaded for this role yet."}
